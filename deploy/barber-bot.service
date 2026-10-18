@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram bot: запись клиентов в барбершоп
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/barber_bot
+ExecStart=/opt/barber_bot/.venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
