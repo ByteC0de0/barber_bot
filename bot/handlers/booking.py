@@ -1,22 +1,19 @@
-"""Запись клиента: услуга → дата → время → подтверждение."""
+"""Запись клиента: услуга → дата → время → подтверждение.
 
-from datetime import date, timedelta
+Кнопка «Подтвердить» появляется только для записи, которая прошла проверку
+BookingRequest (bot/schemas.py). При нажатии она проверяется ещё раз —
+за это время слот могли занять.
+"""
+
+from datetime import date, datetime
 
 from aiogram import Bot, F, Router, html
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, User
+from pydantic import ValidationError
 
 from bot import formatting as fmt
-from bot.callbacks import (
-    BOOK_ABORT,
-    BOOK_SERVICES,
-    ConfirmCb,
-    DayCb,
-    ServiceCb,
-    SlotCb,
-    unpack_day,
-    unpack_dt,
-)
+from bot.callbacks import BOOK_ABORT, BOOK_SERVICES, ConfirmCb, DayCb, ServiceCb, SlotCb
 from bot.config import Config
 from bot.database import Database, Service
 from bot.keyboards.client import (
@@ -29,6 +26,7 @@ from bot.keyboards.client import (
 )
 from bot.messaging import edit_message, notify_admins
 from bot.scheduling import booking_days, free_slots
+from bot.schemas import BookingRequest, first_error
 
 router = Router()
 
@@ -44,6 +42,30 @@ async def _limit_error(user_id: int, db: Database, config: Config) -> str | None
             "Отмените одну в «Мои записи», чтобы записаться снова."
         )
     return None
+
+
+async def validate_booking(
+    service: Service, start: datetime, user: User, db: Database, config: Config
+) -> BookingRequest | str:
+    """Собирает и проверяет запись. Возвращает готовую модель или текст ошибки."""
+    day_free = await free_slots(db, config, service.duration, [start.date()])
+    try:
+        return BookingRequest.model_validate(
+            {
+                "service": service,
+                "start": start,
+                "user_id": user.id,
+                "client_name": user.full_name,
+                "client_username": user.username,
+            },
+            context={
+                "config": config,
+                "now": config.now(),
+                "free_slots": day_free.get(start.date(), []),
+            },
+        )
+    except ValidationError as e:
+        return first_error(e)
 
 
 def _service_header(service: Service) -> str:
@@ -127,26 +149,33 @@ async def choose_slot(
     callback: CallbackQuery, callback_data: DayCb, db: Database, config: Config
 ) -> None:
     if service := await _get_service(callback, callback_data.service_id, db):
-        await _show_slots(callback, service, unpack_day(callback_data.day), db, config)
+        await _show_slots(callback, service, callback_data.day_date, db, config)
         await callback.answer()
 
 
 @router.callback_query(SlotCb.filter())
 async def review_booking(
-    callback: CallbackQuery, callback_data: SlotCb, db: Database
+    callback: CallbackQuery, callback_data: SlotCb, db: Database, config: Config
 ) -> None:
     service = await _get_service(callback, callback_data.service_id, db)
     if service is None:
         return
-    start = unpack_dt(callback_data.at)
-    end = start + timedelta(minutes=service.duration)
+    start = callback_data.start
+    result = await validate_booking(service, start, callback.from_user, db, config)
+    if isinstance(result, str):
+        # Без кнопки «Подтвердить»: показываем причину и актуальное время
+        await callback.answer(result, show_alert=True)
+        await _show_slots(callback, service, start.date(), db, config)
+        return
+
     await edit_message(
         callback,
         "Проверьте запись:\n\n"
         f"💈 {html.bold(html.quote(service.name))}\n"
         f"📅 {fmt.day_long(start.date())}\n"
-        f"🕐 {fmt.hm(start)}–{fmt.hm(end)}\n"
-        f"💰 {fmt.price(service.price)}",
+        f"🕐 {fmt.hm(result.start)}–{fmt.hm(result.end)}\n"
+        f"💰 {fmt.price(service.price)}\n"
+        f"👤 {html.quote(result.client_name)}",
         confirm_kb(service.id, start),
     )
     await callback.answer()
@@ -163,31 +192,29 @@ async def confirm_booking(
     service = await _get_service(callback, callback_data.service_id, db)
     if service is None:
         return
-    user = callback.from_user
-    if error := await _limit_error(user.id, db, config):
+    if error := await _limit_error(callback.from_user.id, db, config):
         await callback.answer(error, show_alert=True)
         return
 
-    # Пока клиент думал, время могли занять, закрыть или оно могло пройти —
-    # проверяем заново по актуальным данным.
-    start = unpack_dt(callback_data.at)
+    start = callback_data.start
+    result = await validate_booking(service, start, callback.from_user, db, config)
     booking = None
-    if start.date() in booking_days(config):
-        day_free = await free_slots(db, config, service.duration, [start.date()])
-        if start in day_free.get(start.date(), []):
-            booking = await db.create_booking(
-                user_id=user.id,
-                client_name=user.full_name,
-                client_username=user.username,
-                service=service,
-                start=start,
-                now=config.now(),
-            )
+    if isinstance(result, BookingRequest):
+        # База ещё раз проверяет пересечения внутри транзакции — на случай,
+        # если двое подтверждают одно время одновременно
+        booking = await db.create_booking(
+            user_id=result.user_id,
+            client_name=result.client_name,
+            client_username=result.client_username,
+            service=result.service,
+            start=result.start,
+            now=config.now(),
+        )
+        if booking is None:
+            result = "Увы, это время уже занято. Выберите другое."
 
     if booking is None:
-        await callback.answer(
-            "Увы, это время уже занято или прошло. Выберите другое.", show_alert=True
-        )
+        await callback.answer(result, show_alert=True)
         await _show_slots(callback, service, start.date(), db, config)
         return
 

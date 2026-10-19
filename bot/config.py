@@ -1,32 +1,93 @@
-"""Настройки бота. Читаем их из файла .env, чтобы не хранить секреты в коде."""
+"""Настройки бота из .env. Все проверки значений — здесь, в одной Pydantic-модели."""
 
-import os
-from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time
 from pathlib import Path
+from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from dotenv import load_dotenv
+from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Подгружаем переменные из .env в окружение процесса (os.environ)
-load_dotenv(BASE_DIR / ".env")
+# NoDecode: строку "1,2" из .env разбираем сами, а не как JSON
+IntList = Annotated[tuple[int, ...], NoDecode]
 
 
-@dataclass(frozen=True)
-class Config:
-    bot_token: str
-    admin_ids: frozenset[int]
-    salon_name: str
-    tz: ZoneInfo
-    work_start: time
-    work_end: time
-    slot_step: int  # шаг сетки записи, минут
-    days_ahead: int  # на сколько дней вперёд открыта запись
-    reminder_hours: tuple[int, ...]
-    max_active_bookings: int
-    db_path: Path
+def _split_ints(value: object) -> object:
+    if isinstance(value, str):
+        return tuple(int(part) for part in value.split(",") if part.strip())
+    return value
+
+
+class Config(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=BASE_DIR / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        frozen=True,
+    )
+
+    bot_token: str = Field(pattern=r"^\d+:[\w-]+$")
+    admin_ids: IntList = ()
+    salon_name: str = Field("Барбершоп «Демо»", min_length=1, max_length=64)
+    timezone: str = "Europe/Moscow"
+    work_start: time = time(10)
+    work_end: time = time(20)
+    slot_step: int = Field(30, ge=5, le=240)  # шаг сетки записи, минут
+    days_ahead: int = Field(14, ge=1, le=90)  # на сколько дней вперёд открыта запись
+    reminder_hours: IntList = (24, 2)
+    max_active_bookings: int = Field(3, ge=1, le=20)
+    db_path: Path = Path("data/bot.db")
+
+    @field_validator("admin_ids", "reminder_hours", mode="before")
+    @classmethod
+    def _parse_int_list(cls, value: object) -> object:
+        return _split_ints(value)
+
+    @field_validator("admin_ids")
+    @classmethod
+    def _check_admin_ids(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(admin_id <= 0 for admin_id in value):
+            raise ValueError("Telegram ID — положительные числа")
+        return value
+
+    @field_validator("reminder_hours")
+    @classmethod
+    def _check_reminders(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(not 1 <= h <= 168 for h in value):
+            raise ValueError("напоминать можно за 1–168 часов")
+        return tuple(sorted(set(value), reverse=True))
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"неизвестный часовой пояс {value!r}") from None
+        return value
+
+    @field_validator("db_path")
+    @classmethod
+    def _absolute_db_path(cls, value: Path) -> Path:
+        return value if value.is_absolute() else BASE_DIR / value
+
+    @model_validator(mode="after")
+    def _check_work_hours(self) -> "Config":
+        if self.work_start >= self.work_end:
+            raise ValueError("WORK_START должно быть раньше WORK_END")
+        day = date.today()
+        minutes = (
+            datetime.combine(day, self.work_end) - datetime.combine(day, self.work_start)
+        ).seconds // 60
+        if self.slot_step > minutes:
+            raise ValueError("SLOT_STEP больше рабочего дня")
+        return self
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
 
     def now(self) -> datetime:
         """Текущее время салона без секунд. В базе всё хранится в этом поясе."""
@@ -36,68 +97,12 @@ class Config:
         return user_id in self.admin_ids
 
 
-def _get(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def _int(name: str, default: int) -> int:
-    value = _get(name, str(default))
-    try:
-        return int(value)
-    except ValueError:
-        raise RuntimeError(f"{name} должно быть числом, а сейчас: {value!r}") from None
-
-
-def _int_list(name: str, default: str) -> tuple[int, ...]:
-    value = _get(name, default)
-    try:
-        return tuple(int(part) for part in value.split(",") if part.strip())
-    except ValueError:
-        raise RuntimeError(
-            f"{name} — числа через запятую, а сейчас: {value!r}"
-        ) from None
-
-
-def _time(name: str, default: str) -> time:
-    value = _get(name, default)
-    try:
-        return time.fromisoformat(value)
-    except ValueError:
-        raise RuntimeError(f"{name} — время в формате ЧЧ:ММ, а сейчас: {value!r}") from None
-
-
 def load_config() -> Config:
-    token = _get("BOT_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "BOT_TOKEN не задан. Открой файл .env и впиши токен от @BotFather."
-        )
-
-    tz_name = _get("TIMEZONE", "Europe/Moscow")
     try:
-        tz = ZoneInfo(tz_name)
-    except ZoneInfoNotFoundError:
-        raise RuntimeError(f"Неизвестный часовой пояс TIMEZONE={tz_name!r}") from None
-
-    work_start = _time("WORK_START", "10:00")
-    work_end = _time("WORK_END", "20:00")
-    if work_start >= work_end:
-        raise RuntimeError("WORK_START должно быть раньше WORK_END")
-
-    db_path = Path(_get("DB_PATH", "data/bot.db"))
-    if not db_path.is_absolute():
-        db_path = BASE_DIR / db_path
-
-    return Config(
-        bot_token=token,
-        admin_ids=frozenset(_int_list("ADMIN_IDS", "")),
-        salon_name=_get("SALON_NAME", "Барбершоп «Демо»"),
-        tz=tz,
-        work_start=work_start,
-        work_end=work_end,
-        slot_step=_int("SLOT_STEP", 30),
-        days_ahead=_int("DAYS_AHEAD", 14),
-        reminder_hours=tuple(sorted(set(_int_list("REMINDER_HOURS", "24,2")), reverse=True)),
-        max_active_bookings=_int("MAX_ACTIVE_BOOKINGS", 3),
-        db_path=db_path,
-    )
+        return Config()
+    except ValidationError as e:
+        problems = "\n".join(
+            f"  {'.'.join(map(str, err['loc'])).upper() or 'настройки'}: {err['msg']}"
+            for err in e.errors()
+        )
+        raise RuntimeError(f"Ошибка в настройках .env:\n{problems}") from None

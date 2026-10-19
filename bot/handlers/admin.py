@@ -5,9 +5,10 @@ from datetime import date, datetime, timedelta
 from aiogram import Bot, F, Router, html
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
+from pydantic import ValidationError
 
 from bot import formatting as fmt
-from bot.callbacks import AdminCb, unpack_day, unpack_dt
+from bot.callbacks import AdminCb
 from bot.config import Config
 from bot.database import Database, day_bounds
 from bot.filters import IsAdmin
@@ -15,6 +16,7 @@ from bot.keyboards import admin as kb
 from bot.keyboards.client import BTN_ADMIN, BTN_BOOK
 from bot.messaging import edit_message, send_safe
 from bot.scheduling import booking_days, time_grid
+from bot.schemas import BlockRequest, first_error
 
 router = Router()
 # Все обработчики этого роутера доступны только админам
@@ -97,7 +99,7 @@ async def pick_day(callback: CallbackQuery, config: Config) -> None:
 async def show_day(
     callback: CallbackQuery, callback_data: AdminCb, db: Database, config: Config
 ) -> None:
-    await _show_day(callback, unpack_day(callback_data.day), db, config)
+    await _show_day(callback, callback_data.day_date, db, config)
     await callback.answer()
 
 
@@ -160,7 +162,7 @@ async def block_pick(callback: CallbackQuery, config: Config) -> None:
 
 @router.callback_query(action("block_day"))
 async def block_day(callback: CallbackQuery, callback_data: AdminCb, config: Config) -> None:
-    day = unpack_day(callback_data.day)
+    day = callback_data.day_date
     now = config.now()
     step = timedelta(minutes=config.slot_step)
     # Начать перерыв можно с любой отметки сетки, которая ещё не закончилась
@@ -176,7 +178,7 @@ async def block_day(callback: CallbackQuery, callback_data: AdminCb, config: Con
 
 @router.callback_query(action("block_from"))
 async def block_from(callback: CallbackQuery, callback_data: AdminCb, config: Config) -> None:
-    start = unpack_dt(callback_data.start)
+    start = callback_data.start_dt
     ends = [t for t in time_grid(start.date(), config) if t > start]
     await edit_message(
         callback,
@@ -188,9 +190,23 @@ async def block_from(callback: CallbackQuery, callback_data: AdminCb, config: Co
 
 
 async def _create_block(
-    callback: CallbackQuery, start: datetime, end: datetime, reason: str, db: Database
+    callback: CallbackQuery,
+    start: datetime,
+    end: datetime,
+    reason: str,
+    db: Database,
+    config: Config,
 ) -> None:
-    block, conflicts = await db.create_block(start, end, reason)
+    try:
+        request = BlockRequest.model_validate(
+            {"start": start, "end": end, "reason": reason},
+            context={"config": config, "now": config.now()},
+        )
+    except ValidationError as e:
+        await callback.answer(first_error(e), show_alert=True)
+        return
+
+    block, conflicts = await db.create_block(request.start, request.end, request.reason)
     if block is None:
         lines = ["⚠️ Нельзя закрыть это время — на него есть записи:", ""]
         lines += [
@@ -211,16 +227,20 @@ async def _create_block(
 
 
 @router.callback_query(action("block_full"))
-async def block_full(callback: CallbackQuery, callback_data: AdminCb, db: Database) -> None:
-    start, end = day_bounds(unpack_day(callback_data.day))
-    await _create_block(callback, start, end, "Выходной", db)
+async def block_full(
+    callback: CallbackQuery, callback_data: AdminCb, db: Database, config: Config
+) -> None:
+    start, end = day_bounds(callback_data.day_date)
+    await _create_block(callback, start, end, "Выходной", db, config)
 
 
 @router.callback_query(action("block_to"))
-async def block_to(callback: CallbackQuery, callback_data: AdminCb, db: Database) -> None:
-    start = unpack_dt(callback_data.start)
-    end = unpack_dt(callback_data.end)
-    await _create_block(callback, start, end, "Перерыв", db)
+async def block_to(
+    callback: CallbackQuery, callback_data: AdminCb, db: Database, config: Config
+) -> None:
+    await _create_block(
+        callback, callback_data.start_dt, callback_data.end_dt, "Перерыв", db, config
+    )
 
 
 # --- Открыть время ---

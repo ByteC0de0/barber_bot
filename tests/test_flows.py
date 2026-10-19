@@ -4,7 +4,7 @@ from datetime import datetime, time, timedelta
 
 from aiogram.types import ReplyKeyboardMarkup, User
 
-from bot.callbacks import AdminCb, ConfirmCb, pack_dt
+from bot.callbacks import AdminCb, ConfirmCb, SlotCb, pack_dt
 from bot.formatting import day_short
 from bot.keyboards.client import BTN_ADMIN, BTN_BOOK, BTN_MY
 from tests.conftest import ADMIN_ID, make_config
@@ -89,10 +89,55 @@ async def test_past_and_off_hours_time_rejected(config, db):
     h = Harness(config, db)
     past = config.now().replace(minute=0) - timedelta(hours=1)
     night = datetime.combine(tomorrow(config), time(3))
-    for start in (past, night):
+    for start, message in ((past, "уже прошло"), (night, "Салон работает")):
         await h.click(CLIENT, ConfirmCb(service_id=1, at=pack_dt(start)))
-        assert "уже занято или прошло" in h.last_alert()
+        assert message in h.last_alert()
     assert await db.get_user_upcoming(CLIENT.id, config.now() - timedelta(days=1)) == []
+
+
+@async_test
+async def test_no_confirm_button_for_taken_time(config, db):
+    h = Harness(config, db)
+    start = datetime.combine(tomorrow(config), time(12))
+    await h.click(CLIENT, ConfirmCb(service_id=1, at=pack_dt(start)))  # CLIENT занял 12:00
+
+    # OTHER открыл экран подтверждения со старой кнопкой времени 12:00
+    await h.click(OTHER, SlotCb(service_id=1, at=pack_dt(start)))
+    assert "уже занято" in h.last_alert()
+    assert not any("Подтвердить" in t for t in h.button_texts(OTHER.id))
+    assert "12:00" not in h.button_texts(OTHER.id)  # показан актуальный список времени
+
+
+@async_test
+async def test_confirm_screen_shows_all_details(config, db):
+    h = Harness(config, db)
+    await h.send(CLIENT, BTN_BOOK)
+    await h.click_button(CLIENT, "Мужская стрижка")
+    await h.click_button(CLIENT, day_short(tomorrow(config)))
+    await h.click_button(CLIENT, "10:00")
+    text = h.last(CLIENT.id).text
+    for part in ("Мужская стрижка", "10:00–11:00", "1 500 ₽", "Иван"):
+        assert part in text
+    assert any("Подтвердить" in t for t in h.button_texts(CLIENT.id))
+
+
+@async_test
+async def test_forged_callback_goes_to_fallback(config, db):
+    h = Harness(config, db)
+    await h.click(CLIENT, "ok:1:203099999999")
+    assert "устарела" in h.last_alert()
+    assert await db.get_user_upcoming(CLIENT.id, config.now()) == []
+
+
+@async_test
+async def test_admin_invalid_break_rejected(config, db):
+    h = Harness(config, db)
+    day = tomorrow(config)
+    start = datetime.combine(day, time(15))
+    end = datetime.combine(day, time(14))
+    await h.click(ADMIN, AdminCb(action="block_to", start=pack_dt(start), end=pack_dt(end)))
+    assert "позже начала" in h.last_alert()
+    assert await db.get_day_blocks(day) == []
 
 
 @async_test

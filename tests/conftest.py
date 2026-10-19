@@ -1,6 +1,4 @@
 import asyncio
-from datetime import time
-from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -13,11 +11,11 @@ ADMIN_ID = 1000
 def make_config(tmp_path, **overrides) -> Config:
     values = dict(
         bot_token="123456:TEST",
-        admin_ids=frozenset({ADMIN_ID}),
+        admin_ids=(ADMIN_ID,),
         salon_name="Тестовый салон",
-        tz=ZoneInfo("Europe/Moscow"),
-        work_start=time(10),
-        work_end=time(20),
+        timezone="Europe/Moscow",
+        work_start="10:00",
+        work_end="20:00",
         slot_step=30,
         days_ahead=14,
         reminder_hours=(24, 2),
@@ -25,7 +23,8 @@ def make_config(tmp_path, **overrides) -> Config:
         db_path=tmp_path / "test.db",
     )
     values.update(overrides)
-    return Config(**values)
+    # _env_file=None: тесты не читают настоящий .env
+    return Config(_env_file=None, **values)
 
 
 @pytest.fixture
